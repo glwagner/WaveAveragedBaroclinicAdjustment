@@ -2,13 +2,17 @@ using Oceananigans
 using Oceananigans.Units
 using GLMakie
 
-arch = CPU()
+arch = GPU()
 Lx = 1000kilometers # east-west extent [m]
 Ly = 1000kilometers # north-south extent [m]
-Lz = 1kilometers    # depth [m]
+Lz = 400 # depth [m]
+
+Nx = 256
+Ny = 256
+Nz = 128
 
 grid = RectilinearGrid(arch,
-                       size = (48, 48, 8),
+                       size = (Nx, Ny, Nz),
                        x = (0, Lx),
                        y = (-Ly/2, Ly/2),
                        z = (-Lz, 0),
@@ -62,7 +66,10 @@ function print_progress(sim)
 
     @printf("[%05.2f%%] i: %d, t: %s, wall time: %s, max(u): (%6.3e, %6.3e, %6.3e) m/s, next Δt: %s\n",
             progress, iteration(sim), prettytime(sim), prettytime(elapsed),
-            maximum(abs, u), maximum(abs, v), maximum(abs, w), prettytime(sim.Δt))
+            maximum(abs, interior(u)),
+            maximum(abs, interior(v)),
+            maximum(abs, interior(w)),
+            prettytime(sim.Δt))
 
     wall_clock[] = time_ns()
     
@@ -112,8 +119,6 @@ simulation.output_writers[:zonal] = JLD2OutputWriter(model, (; b=B, u=U, v=V);
 
 run!(simulation)
 
-@info "Simulation completed in " * prettytime(simulation.run_wall_time)
-
 top_slice_filename = filename * "_top_slice.jld2"
 zonal_average_filename = filename * "_zonal_average.jld2"
 
@@ -152,7 +157,9 @@ V = @lift interior(Vt[$n], 1, :, :)
 # and then build our plot:
 
 hm = heatmap!(axb, b_top, colorrange=(0, Δb), colormap=:thermal)
-hm = heatmap!(axw, w_top, colorrange=(-5e-3, 5e-3), colormap=:balance)
+hm = heatmap!(axw, w_top, colorrange=(-1e-4, 1e-4), colormap=:balance)
 hm = heatmap!(axu, U; colorrange=(-5e-1, 5e-1), colormap=:balance)
 hm = heatmap!(axv, V; colorrange=(-1e-1, 1e-1), colormap=:balance)
+
+display(fig)
 
