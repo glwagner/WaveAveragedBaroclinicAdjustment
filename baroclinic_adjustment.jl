@@ -2,13 +2,17 @@ using Oceananigans
 using Oceananigans.Units
 using GLMakie
 
-arch = CPU()
+arch = GPU()
 Lx = 1000kilometers # east-west extent [m]
 Ly = 1000kilometers # north-south extent [m]
 Lz = 256 # depth [m]
 
+Nx = 256
+Ny = 256
+Nz = 128
+
 grid = RectilinearGrid(arch,
-                       size = (64, 64, 8),
+                       size = (Nx, Ny, Nz),
                        x = (0, Lx),
                        y = (-Ly/2, Ly/2),
                        z = (-Lz, 0),
@@ -68,7 +72,10 @@ function print_progress(sim)
 
     @printf("[%05.2f%%] i: %d, t: %s, wall time: %s, max(u): (%6.3e, %6.3e, %6.3e) m/s, next Δt: %s\n",
             progress, iteration(sim), prettytime(sim), prettytime(elapsed),
-            maximum(abs, u), maximum(abs, v), maximum(abs, w), prettytime(sim.Δt))
+            maximum(abs, interior(u)),
+            maximum(abs, interior(v)),
+            maximum(abs, interior(w)),
+            prettytime(sim.Δt))
 
     wall_clock[] = time_ns()
     
@@ -119,8 +126,6 @@ simulation.output_writers[:zonal] = JLD2OutputWriter(model, (; b=B, u=U, v=V);
 @info "Running the simulation..."
 
 run!(simulation)
-
-@info "Simulation completed in " * prettytime(simulation.run_wall_time)
 
 top_slice_filename = filename * "_top_slice.jld2"
 zonal_average_filename = filename * "_zonal_average.jld2"
