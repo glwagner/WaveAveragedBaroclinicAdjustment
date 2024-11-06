@@ -5,16 +5,27 @@ using GLMakie
 arch = CPU()
 Lx = 1000kilometers # east-west extent [m]
 Ly = 1000kilometers # north-south extent [m]
-Lz = 1kilometers    # depth [m]
+Lz = 256 # depth [m]
 
 grid = RectilinearGrid(arch,
-                       size = (48, 48, 8),
+                       size = (64, 64, 8),
                        x = (0, Lx),
                        y = (-Ly/2, Ly/2),
                        z = (-Lz, 0),
                        topology = (Periodic, Bounded, Bounded))
 
 using Oceananigans.BuoyancyModels: g_Earth
+
+f = 1e-4
+N² = 1e-4 # [s⁻²] buoyancy frequency / stratification
+Ri = 10.0
+Δy = 100kilometers # width of the region of the front
+M² = sqrt(f^2 * N² / Ri)
+Δb = M² * Δy
+
+# k = σ^2 / g
+# u★ = sqrt(abs(τx))
+# uˢ = u★ / La^2
 
 g = 9.81
 a = 0.8 # m
@@ -27,19 +38,14 @@ parameters = (; k, Uˢ)
 ∂z_uˢ(z, t, p) = 1 / (2 * p.k) * p.Uˢ * exp(2 * p.k * z)
 stokes_drift = UniformStokesDrift(; ∂z_uˢ, parameters)
 
-model = NonhydrostaticModel(; grid, stokes_drift,
-                            coriolis = BetaPlane(latitude = -45),
+model = NonhydrostaticModel(; grid, # stokes_drift,
+                            coriolis = FPlane(; f),
                             buoyancy = BuoyancyTracer(),
                             tracers = (:b, :c),
                             advection = WENO())
 
 ramp(y, Δy) = min(max(0, y/Δy + 1/2), 1)
 
-N² = 1e-5 # [s⁻²] buoyancy frequency / stratification
-M² = 1e-7 # [s⁻²] horizontal buoyancy gradient
-
-Δy = 100kilometers # width of the region of the front
-Δb = Δy * M²       # buoyancy jump associated with the front
 ϵb = 1e-2 * Δb     # noise amplitude
 hc = Lz / 10       # tracer decay scale
 
@@ -48,8 +54,8 @@ cᵢ(x, y, z) = exp(-y^2 / 2Δy^2) * exp(z / hc)
 
 set!(model, b=bᵢ)
 
-simulation = Simulation(model, Δt=20minutes, stop_time=20days)
-conjure_time_step_wizard!(simulation, IterationInterval(20), cfl=0.2, max_Δt=20minutes)
+simulation = Simulation(model, Δt=20minutes, stop_time=30days)
+conjure_time_step_wizard!(simulation, IterationInterval(20), cfl=0.7, max_Δt=20minutes)
 
 using Printf
 
@@ -79,12 +85,14 @@ add_callback!(simulation, print_progress, IterationInterval(100))
 b = model.tracers.b
 u, v, w = model.velocities
 ζ = ∂x(v) - ∂y(u)
+ξ = ∂z(u) - ∂x(w)
+s = @at (Center, Center, Center) sqrt(u^2 + v^2)
 B = Average(b, dims=1)
 U = Average(u, dims=1)
 V = Average(v, dims=1)
 
 filename = "baroclinic_adjustment"
-save_fields_interval = 0.5day
+save_fields_interval = 0.2day
 
 slicers = (east = (grid.Nx, :, :),
            north = (:, grid.Ny, :),
@@ -94,7 +102,7 @@ slicers = (east = (grid.Nx, :, :),
 for side in keys(slicers)
     indices = slicers[side]
 
-    simulation.output_writers[side] = JLD2OutputWriter(model, (; b, ζ, w);
+    simulation.output_writers[side] = JLD2OutputWriter(model, (; b, ζ, ξ, s, w);
                                                        filename = filename * "_$(side)_slice",
                                                        schedule = TimeInterval(save_fields_interval),
                                                        overwrite_existing = true,
@@ -120,39 +128,38 @@ zonal_average_filename = filename * "_zonal_average.jld2"
 bt_top = FieldTimeSeries(top_slice_filename, "b")
 ζt_top = FieldTimeSeries(top_slice_filename, "ζ")
 wt_top = FieldTimeSeries(top_slice_filename, "w")
-Ut = FieldTimeSeries(zonal_average_filename, "u")
-Vt = FieldTimeSeries(zonal_average_filename, "v")
-Nt = length(Vt)
+st_top = FieldTimeSeries(top_slice_filename, "s")
+ξt_top = FieldTimeSeries(top_slice_filename, "ξ")
+Nt = length(bt_top)
 
 # Next, we set up a plot with 4 panels. The top panels are large and square, while
 # the bottom panels get a reduced aspect ratio through `rowsize!`.
 
 set_theme!(Theme(fontsize=24))
 
-fig = Figure(size=(1800, 1000))
+fig = Figure(size=(1000, 1000))
 
-axb = Axis(fig[1, 1], xlabel="x (km)", ylabel="y (km)", aspect=1)
-axw = Axis(fig[1, 2], xlabel="x (km)", ylabel="y (km)", aspect=1, yaxisposition=:right)
-axu = Axis(fig[2, 1], xlabel="y (km)", ylabel="z (m)")
-axv = Axis(fig[2, 2], xlabel="y (km)", ylabel="z (m)", yaxisposition=:right)
-
-rowsize!(fig.layout, 2, Relative(0.3))
+axb = Axis(fig[1, 1], xlabel="x (km)", ylabel="y (km)", aspect=1, xaxisposition=:top)
+axξ = Axis(fig[1, 2], xlabel="x (km)", ylabel="y (km)", aspect=1, xaxisposition=:top, yaxisposition=:right)
+axs = Axis(fig[2, 1], xlabel="x (km)", ylabel="y (km)", aspect=1)
+axζ = Axis(fig[2, 2], xlabel="x (km)", ylabel="y (km)", aspect=1, yaxisposition=:right)
 
 # To prepare a plot for animation, we index the timeseries with an `Observable`,
 
 slider = Slider(fig[3, 1:2], range=1:Nt, startvalue=1)
 n = slider.value
 
-b_top = @lift interior(bt_top[$n], :, :, 1)
-ζ_top = @lift interior(ζt_top[$n], :, :, 1)
-w_top = @lift interior(wt_top[$n], :, :, 1)
-U = @lift interior(Ut[$n], 1, :, :)
-V = @lift interior(Vt[$n], 1, :, :)
+b_top = @lift bt_top[$n]
+ζ_top = @lift ζt_top[$n]
+ξ_top = @lift ξt_top[$n]
+s_top = @lift st_top[$n]
 
 # and then build our plot:
 
 hm = heatmap!(axb, b_top, colorrange=(0, Δb), colormap=:thermal)
-hm = heatmap!(axw, w_top, colorrange=(-5e-3, 5e-3), colormap=:balance)
-hm = heatmap!(axu, U; colorrange=(-5e-1, 5e-1), colormap=:balance)
-hm = heatmap!(axv, V; colorrange=(-1e-1, 1e-1), colormap=:balance)
+hm = heatmap!(axξ, ξ_top, colorrange=(-1e-2, 1e-2), colormap=:balance)
+hm = heatmap!(axζ, ζ_top, colorrange=(-1e-4, 1e-4), colormap=:balance)
+hm = heatmap!(axs, s_top, colorrange=(0, 1e0), colormap=:magma)
+
+display(fig)
 
