@@ -1,67 +1,70 @@
 using Oceananigans
 using Oceananigans.Units
-using GLMakie
+using Random
+using Printf
+
+Random.seed!(42)
+
+f = 1e-4
+N² = 1e-6 # [s⁻²] buoyancy frequency / stratification
+Ri = 1
+H = 200
+h = 100
+T = 14 # 6 # 10, 14, 18, 22
+ϵ = 0.3
+g = 9.81
+
+L = sqrt(N²) * h / f # Rossby radius of deformation
+Δy = L # width of the region of the front
+
+M² = sqrt(f^2 * N² / Ri)
+Δb = M² * Δy
+σ = 2π / T
+k = σ^2 / g # m⁻¹
+Uˢ = a * ϵ * σ # m s⁻¹
 
 arch = GPU()
-Lx = 1000kilometers # east-west extent [m]
-Ly = 1000kilometers # north-south extent [m]
-Lz = 256 # depth [m]
+Lx = 20L  # east-west extent [m]
+Ly = 20L  # north-south extent [m]
+Lz = H    # depth [m]
 
-Nx = 256
-Ny = 256
-Nz = 128
+Nx = 192
+Ny = 192
+Nz = 48
 
 grid = RectilinearGrid(arch,
                        size = (Nx, Ny, Nz),
                        x = (0, Lx),
                        y = (-Ly/2, Ly/2),
                        z = (-Lz, 0),
+                       halo = (5, 5, 5),
                        topology = (Periodic, Bounded, Bounded))
 
-using Oceananigans.BuoyancyModels: g_Earth
+@show grid
 
-f = 1e-4
-N² = 1e-4 # [s⁻²] buoyancy frequency / stratification
-Ri = 10.0
-Δy = 100kilometers # width of the region of the front
-M² = sqrt(f^2 * N² / Ri)
-Δb = M² * Δy
+filename = @sprintf("baroclinic_adjustment_Nx%d_H%d_Ri%d_T%d_ep%d", Nx, H, 10Ri, T, 10ϵ)
 
-# k = σ^2 / g
-# u★ = sqrt(abs(τx))
-# uˢ = u★ / La^2
+@inline ∂z_uˢ(z, t, p) = 2 * p.σ * p.ϵ^2 * exp(2 * p.k * z)
+stokes_drift = UniformStokesDrift(; ∂z_uˢ, parameters=(; k, Uˢ, ϵ, σ))
 
-g = 9.81
-a = 0.8 # m
-λ = 60  # m
-k = 2π / λ# m⁻¹
-σ = sqrt(g * k) # s⁻¹
-Uˢ = a^2 * k * σ # m s⁻¹
-
-parameters = (; k, Uˢ)
-∂z_uˢ(z, t, p) = 1 / (2 * p.k) * p.Uˢ * exp(2 * p.k * z)
-stokes_drift = UniformStokesDrift(; ∂z_uˢ, parameters)
-
-model = NonhydrostaticModel(; grid, # stokes_drift,
+model = NonhydrostaticModel(; grid, stokes_drift,
                             coriolis = FPlane(; f),
                             buoyancy = BuoyancyTracer(),
-                            tracers = (:b, :c),
-                            advection = WENO())
+                            tracers = :b,
+                            advection = WENO(order=9))
 
-ramp(y, Δy) = min(max(0, y/Δy + 1/2), 1)
+@show model
+@show model.stokes_drift
 
-ϵb = 1e-2 * Δb     # noise amplitude
-hc = Lz / 10       # tracer decay scale
+step(y, Δy) = min(max(0, y/Δy + 1/2), 1)
+ramp(y, Δy=1) = max(0, y / Δy)
 
-bᵢ(x, y, z) = N² * z + Δb * ramp(y, Δy) + ϵb * randn()
-cᵢ(x, y, z) = exp(-y^2 / 2Δy^2) * exp(z / hc)
-
+ϵb = 1e-2 * Δb # noise amplitude
+bᵢ(x, y, z) = N² * z + Δb * step(y, Δy) * ramp(1 + z/h) + ϵb * randn()
 set!(model, b=bᵢ)
 
-simulation = Simulation(model, Δt=20minutes, stop_time=30days)
-conjure_time_step_wizard!(simulation, IterationInterval(20), cfl=0.7, max_Δt=20minutes)
-
-using Printf
+simulation = Simulation(model, Δt=1minutes, stop_time=30days)
+conjure_time_step_wizard!(simulation, IterationInterval(10), cfl=0.7, max_Δt=2minutes)
 
 wall_clock = Ref(time_ns())
 
@@ -70,7 +73,7 @@ function print_progress(sim)
     progress = 100 * (time(sim) / sim.stop_time)
     elapsed = (time_ns() - wall_clock[]) / 1e9
 
-    @printf("[%05.2f%%] i: %d, t: %s, wall time: %s, max(u): (%6.3e, %6.3e, %6.3e) m/s, next Δt: %s\n",
+    @printf("[%05.2f%%] n: %d, t: %s, wall time: %s, max(u): (%6.3e, %6.3e, %6.3e) m/s, next Δt: %s\n",
             progress, iteration(sim), prettytime(sim), prettytime(elapsed),
             maximum(abs, interior(u)),
             maximum(abs, interior(v)),
@@ -97,9 +100,8 @@ s = @at (Center, Center, Center) sqrt(u^2 + v^2)
 B = Average(b, dims=1)
 U = Average(u, dims=1)
 V = Average(v, dims=1)
-
-filename = "baroclinic_adjustment"
-save_fields_interval = 0.2day
+w² = Average(w^2, dims=1)
+save_fields_interval = 1day
 
 slicers = (east = (grid.Nx, :, :),
            north = (:, grid.Ny, :),
@@ -116,7 +118,7 @@ for side in keys(slicers)
                                                        indices)
 end
 
-simulation.output_writers[:zonal] = JLD2OutputWriter(model, (; b=B, u=U, v=V);
+simulation.output_writers[:zonal] = JLD2OutputWriter(model, (; b=B, u=U, v=V, w²);
                                                      filename = filename * "_zonal_average",
                                                      schedule = TimeInterval(save_fields_interval),
                                                      overwrite_existing = true)
@@ -126,6 +128,9 @@ simulation.output_writers[:zonal] = JLD2OutputWriter(model, (; b=B, u=U, v=V);
 @info "Running the simulation..."
 
 run!(simulation)
+
+#=
+using GLMakie
 
 top_slice_filename = filename * "_top_slice.jld2"
 zonal_average_filename = filename * "_zonal_average.jld2"
@@ -167,4 +172,4 @@ hm = heatmap!(axζ, ζ_top, colorrange=(-1e-4, 1e-4), colormap=:balance)
 hm = heatmap!(axs, s_top, colorrange=(0, 1e0), colormap=:magma)
 
 display(fig)
-
+=#
